@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timedelta
 import requests
 from sklearn.preprocessing import StandardScaler
+from bs4 import BeautifulSoup
 
 # Gemini API
 try:
@@ -36,6 +37,31 @@ if GEMINI_AVAILABLE and GEMINI_API_KEY:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
         print(f"Warning: Failed to initialize Gemini client: {e}")
+
+def get_gemini_chat(model_name=None):
+    """Get a Gemini chat instance with fallback model names"""
+    if not gemini_client:
+        raise Exception("Gemini client not available")
+    
+    # Try different model names in order of preference
+    model_names = model_name and [model_name] or [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash-exp", 
+        "gemini-1.5-flash",
+        "gemini-pro",
+        "gemini-1.5-pro"
+    ]
+    
+    last_error = None
+    for model in model_names:
+        try:
+            return gemini_client.chats.create(model=model)
+        except Exception as e:
+            last_error = e
+            continue
+    
+    # If all models fail, raise the last error
+    raise Exception(f"Failed to create chat with any model. Last error: {last_error}")
 
 # Load CSV data
 sales_data = None
@@ -551,10 +577,24 @@ def detect_anomalies():
 
 @app.route("/api/health", methods=["GET"])
 def health():
+    gemini_status = "not_available"
+    available_models = []
+    
+    if gemini_client:
+        try:
+            # Try to list available models
+            models = gemini_client.models.list()
+            available_models = [m.name for m in models] if hasattr(models, '__iter__') else []
+            gemini_status = "available"
+        except Exception as e:
+            gemini_status = f"error: {str(e)}"
+    
     return jsonify({
         "status": "healthy",
         "data_loaded": sales_data is not None,
-        "products_count": len(product_columns) if product_columns else 0
+        "products_count": len(product_columns) if product_columns else 0,
+        "gemini_status": gemini_status,
+        "available_models": available_models[:10] if available_models else []  # Limit to first 10
     })
 
 @app.route("/api/anomalies/raw", methods=["GET"])
@@ -579,6 +619,67 @@ def get_raw_anomaly_csv():
     except Exception as e:
         import traceback
         print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/chatbot/ask", methods=["POST"])
+def chatbot_ask():
+    """Handle chatbot questions with current screen content as context using Gemini"""
+    try:
+        data = request.json
+        question = data.get("question")
+        screen_content = data.get("screen_content", "").strip()
+        
+        if not question:
+            return jsonify({"error": "question is required"}), 400
+        
+        if not gemini_client:
+            return jsonify({
+                "error": "Gemini API is not available. Please check your API key configuration."
+            }), 500
+        
+        try:
+            # Create chat with Gemini using fallback model selection
+            chat = get_gemini_chat()
+            
+            # Build prompt with screen content as context
+            if screen_content:
+                prompt = f"""You are a helpful AI assistant for a supply chain management system. The user is viewing their current screen which contains the following content:
+
+Current Screen Content:
+{screen_content}
+
+User Question: {question}
+
+Please answer the user's question based on the screen content above. Analyze the data, tables, charts, or information visible on the screen and provide helpful insights. If the answer cannot be found in the screen content, please say so and provide a general answer if possible."""
+            else:
+                prompt = f"""You are a helpful AI assistant for a supply chain management system. Please answer the following question:
+
+{question}
+
+Provide a clear and helpful answer."""
+            
+            # Send message to Gemini (correct format - no files parameter)
+            response = chat.send_message(prompt)
+            
+            answer = response.text
+            
+            return jsonify({
+                "success": True,
+                "answer": answer
+            })
+            
+        except Exception as e:
+            print(f"Gemini API error: {e}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                "error": f"Failed to process request with Gemini: {str(e)}"
+            }), 500
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/procurement/recommend", methods=["POST"])
@@ -719,7 +820,9 @@ Thresholds: Reliability >= 70%, Lead Time <= 140 days
 
 Provide a concise 2-3 sentence explanation of why this supplier was selected, focusing on the balance between reliability, lead time, and cost."""
                 
-                chat = gemini_client.chats.create(model="gemini-1.5-flash")
+                # Create chat with Gemini using fallback model selection
+                chat = get_gemini_chat()
+                
                 response = chat.send_message(prompt_best)
                 best_explanation = response.text
                 
@@ -742,7 +845,7 @@ Thresholds: Reliability >= 70%, Lead Time <= 140 days
 
 Provide a concise 1-2 sentence explanation of why this supplier was not selected, comparing it to the best option."""
                     
-                    chat_other = gemini_client.chats.create(model="gemini-1.5-flash")
+                    chat_other = get_gemini_chat()
                     response_other = chat_other.send_message(prompt_other)
                     other_explanations[supplier['supplier_id']] = response_other.text
                     

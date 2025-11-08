@@ -7,3 +7,5 @@ torch-geometric
 scikit-learn
 requests
 google-genai
+beautifulsoup4
+lxml

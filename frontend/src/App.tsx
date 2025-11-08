@@ -11,6 +11,7 @@ import ForecastingScreen from "./components/ForecastingScreen";
 import ProcurementScreen from "./components/ProcurementScreen";
 import InventoryScreen from "./components/InventoryScreen";
 import AnomalyScreen from "./components/AnomalyScreen";
+import ChatbotButton from "./components/ChatbotButton";
 
 export default function App() {
   return (
@@ -64,6 +65,7 @@ function Content() {
     <div className="flex flex-col">
       <Authenticated>
         {renderScreen()}
+        <ChatbotButton />
       </Authenticated>
       <Unauthenticated>
         <div className="flex items-center justify-center min-h-[400px] p-8">
