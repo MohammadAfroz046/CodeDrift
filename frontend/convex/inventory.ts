@@ -1,97 +1,50 @@
-import { mutation, query } from "./_generated/server";
+import { mutation, query, action } from "./_generated/server";
 import { v } from "convex/values";
 
-export const optimizeInventory = mutation({
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5000";
+
+export const optimizeInventory = action({
   args: {},
   handler: async (ctx) => {
-    // Get all products and their data
-    const products = await ctx.db.query("products").collect();
-    const optimizationResults = [];
-
-    for (const product of products) {
-      // Get current inventory
-      const inventory = await ctx.db
-        .query("inventory")
-        .withIndex("by_product_id", (q) => q.eq("product_id", product.product_id))
-        .first();
-      
-      if (!inventory) continue;
-
-      // Get recent demand data
-      const demandHistory = await ctx.db
-        .query("demand_history")
-        .withIndex("by_product_and_date", (q) => q.eq("product_id", product.product_id))
-        .collect();
-      
-      const recentDemand = demandHistory
-        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-        .slice(0, 30);
-      
-      const avgDailyDemand = recentDemand.length > 0 
-        ? recentDemand.reduce((sum, d) => sum + d.demand, 0) / recentDemand.length
-        : 50;
-
-      // Get suppliers
-      const suppliers = await ctx.db
-        .query("suppliers")
-        .withIndex("by_product", (q) => q.eq("product_id", product.product_id))
-        .collect();
-      
-      if (suppliers.length === 0) continue;
-
-      // Find best supplier (lowest cost with good reliability)
-      const bestSupplier = suppliers.reduce((best, current) => {
-        const bestScore = (best.reliability * 0.6) + ((1 / best.price_per_unit) * 0.4);
-        const currentScore = (current.reliability * 0.6) + ((1 / current.price_per_unit) * 0.4);
-        return currentScore > bestScore ? current : best;
+    try {
+      // Call backend API to optimize ALL products from CSV dataset
+      // Actions in Convex can use fetch directly
+      const response = await fetch(`${BACKEND_URL}/api/inventory/optimize`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+        },
       });
 
-      // Simple optimization logic (Economic Order Quantity inspired)
-      const annualDemand = avgDailyDemand * 365;
-      const holdingCostRate = 0.2; // 20% of item cost per year
-      const orderingCost = 50; // Fixed cost per order
-      
-      // EOQ formula: sqrt(2 * D * S / H)
-      const holdingCost = bestSupplier.price_per_unit * holdingCostRate;
-      const eoq = Math.sqrt((2 * annualDemand * orderingCost) / holdingCost);
-      
-      // Adjust for capacity constraints
-      const maxOrderQty = inventory.warehouse_capacity - inventory.current_stock;
-      const optimalQty = Math.min(Math.ceil(eoq), maxOrderQty);
-      
-      // Calculate costs
-      const totalCost = optimalQty * bestSupplier.price_per_unit;
-      const daysOfStock = (inventory.current_stock + optimalQty) / avgDailyDemand;
-      
-      // Determine status
-      let status = "Optimal";
-      let warning = null;
-      
-      if (inventory.current_stock < (inventory.reorder_point || 20)) {
-        status = "Understock";
-        warning = "Current stock below reorder point";
-      } else if (daysOfStock > 60) {
-        status = "Overstock";
-        warning = "Excessive inventory - consider reducing orders";
-      } else if (daysOfStock < 14) {
-        status = "Low Stock";
-        warning = "Stock levels may be insufficient";
+      if (!response.ok) {
+        let errorMessage = `HTTP ${response.status}: Failed to optimize inventory`;
+        try {
+          const errorData = await response.json();
+          errorMessage = errorData.error || errorMessage;
+        } catch {
+          // If response is not JSON, use status text
+          errorMessage = response.statusText || errorMessage;
+        }
+        throw new Error(errorMessage);
       }
 
-      optimizationResults.push({
-        product_id: product.product_id,
-        product_name: product.name,
-        current_stock: inventory.current_stock,
-        optimal_quantity: optimalQty,
-        total_cost: totalCost,
-        supplier_name: bestSupplier.name,
-        days_of_stock: Math.round(daysOfStock),
-        status,
-        warning,
-      });
-    }
+      const data = await response.json();
+      const results = data.results || [];
 
-    return optimizationResults;
+      if (results.length === 0) {
+        throw new Error("No optimization results returned. Check backend logs for errors.");
+      }
+
+      return results;
+    } catch (error) {
+      console.error("Inventory optimization error:", error);
+      // Provide more helpful error message
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (errorMessage.includes("ECONNREFUSED") || errorMessage.includes("fetch failed") || errorMessage.includes("NetworkError")) {
+        throw new Error("Cannot connect to backend server. Please ensure the Flask backend is running on http://localhost:5000");
+      }
+      throw new Error(`Failed to optimize inventory: ${errorMessage}`);
+    }
   },
 });
 

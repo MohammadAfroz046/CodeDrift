@@ -1,7 +1,5 @@
 
 import { useState } from "react";
-import { useMutation } from "convex/react";
-import { api } from "../../convex/_generated/api";
 import { toast } from "sonner";
 import Sidebar from "./Sidebar";
 import NotificationBar from "./NotificationBar";
@@ -20,27 +18,72 @@ interface OptimizationResult {
   days_of_stock: number;
   status: string;
   warning: string | null;
+  reorder_point?: number;
+  safety_stock?: number;
+  warehouse_capacity?: number;
+  avg_daily_demand?: number;
+  demand_variability?: number;
 }
 
 export default function InventoryScreen({ onNavigate }: InventoryScreenProps) {
   const [loading, setLoading] = useState(false);
   const [optimizationResults, setOptimizationResults] = useState<OptimizationResult[]>([]);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage] = useState(50); // Show 50 items per page
+  const [filterStatus, setFilterStatus] = useState<string>("all");
   
-  const optimizeInventory = useMutation(api.inventory.optimizeInventory);
+  const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
 
   const handleOptimizeInventory = async () => {
     setLoading(true);
     try {
-      const results = await optimizeInventory();
+      const response = await fetch(`${BACKEND_URL}/api/inventory/optimize`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        let errorMessage = "Failed to optimize inventory";
+        try {
+          const errorData = await response.json();
+          errorMessage = errorData.error || errorMessage;
+        } catch {
+          errorMessage = `HTTP ${response.status}: ${response.statusText || errorMessage}`;
+        }
+        throw new Error(errorMessage);
+      }
+
+      const data = await response.json();
+      const results = data.results || [];
+
+      if (results.length === 0) {
+        throw new Error("No optimization results returned. Check backend logs for errors.");
+      }
+
       setOptimizationResults(results);
-      toast.success("Inventory optimization completed!");
+      setCurrentPage(1); // Reset to first page
+      toast.success(`Inventory optimization completed for ${results.length} products!`);
     } catch (error) {
-      toast.error("Failed to optimize inventory");
-      console.error(error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      toast.error(`Failed to optimize inventory: ${errorMessage}`);
+      console.error("Inventory optimization error:", error);
     } finally {
       setLoading(false);
     }
   };
+
+  // Filter results by status
+  const filteredResults = filterStatus === "all" 
+    ? optimizationResults 
+    : optimizationResults.filter(r => r.status === filterStatus);
+
+  // Pagination
+  const totalPages = Math.ceil(filteredResults.length / itemsPerPage);
+  const startIndex = (currentPage - 1) * itemsPerPage;
+  const endIndex = startIndex + itemsPerPage;
+  const paginatedResults = filteredResults.slice(startIndex, endIndex);
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -52,6 +95,8 @@ export default function InventoryScreen({ onNavigate }: InventoryScreenProps) {
         return "bg-orange-100 text-orange-800";
       case "Low Stock":
         return "bg-yellow-100 text-yellow-800";
+      case "Caution":
+        return "bg-amber-100 text-amber-800";
       default:
         return "bg-gray-100 text-gray-800";
     }
@@ -71,7 +116,14 @@ export default function InventoryScreen({ onNavigate }: InventoryScreenProps) {
         <div className="flex-1 p-6 overflow-auto">
           <div className="max-w-7xl mx-auto">
             <div className="flex justify-between items-center mb-8">
-              <h1 className="text-3xl font-bold text-gray-900">Inventory Optimization</h1>
+              <div>
+                <h1 className="text-3xl font-bold text-gray-900">Inventory Optimization</h1>
+                {optimizationResults.length > 0 && (
+                  <p className="text-sm text-gray-600 mt-1">
+                    Showing {filteredResults.length} of {optimizationResults.length} products
+                  </p>
+                )}
+              </div>
               <button
                 onClick={handleOptimizeInventory}
                 disabled={loading}
@@ -153,16 +205,40 @@ export default function InventoryScreen({ onNavigate }: InventoryScreenProps) {
               </ul>
             </div>
 
-            {/* Results Table */}
+            {/* Filter and Results Table */}
             <div className="bg-white rounded-lg shadow">
               <div className="px-6 py-4 border-b border-gray-200">
-                <h2 className="text-xl font-semibold text-gray-900">Optimization Results</h2>
-                <p className="text-sm text-gray-600 mt-1">
-                  Recommended order quantities and cost analysis
-                </p>
+                <div className="flex justify-between items-center">
+                  <div>
+                    <h2 className="text-xl font-semibold text-gray-900">Optimization Results</h2>
+                    <p className="text-sm text-gray-600 mt-1">
+                      Recommended order quantities and cost analysis for all products
+                    </p>
+                  </div>
+                  {optimizationResults.length > 0 && (
+                    <div className="flex gap-2">
+                      <select
+                        value={filterStatus}
+                        onChange={(e) => {
+                          setFilterStatus(e.target.value);
+                          setCurrentPage(1);
+                        }}
+                        className="border border-gray-300 rounded-md px-3 py-2 text-sm"
+                      >
+                        <option value="all">All Status</option>
+                        <option value="Understock">Understock</option>
+                        <option value="Low Stock">Low Stock</option>
+                        <option value="Caution">Caution</option>
+                        <option value="Optimal">Optimal</option>
+                        <option value="Overstock">Overstock</option>
+                      </select>
+                    </div>
+                  )}
+                </div>
               </div>
               
               {optimizationResults.length > 0 ? (
+                <>
                 <div className="overflow-x-auto">
                   <table className="min-w-full divide-y divide-gray-200">
                     <thead className="bg-gray-50">
@@ -191,7 +267,7 @@ export default function InventoryScreen({ onNavigate }: InventoryScreenProps) {
                       </tr>
                     </thead>
                     <tbody className="bg-white divide-y divide-gray-200">
-                      {optimizationResults.map((result) => (
+                      {paginatedResults.map((result) => (
                         <tr key={result.product_id} className="hover:bg-gray-50">
                           <td className="px-6 py-4 whitespace-nowrap">
                             <div>
@@ -230,9 +306,37 @@ export default function InventoryScreen({ onNavigate }: InventoryScreenProps) {
                     </tbody>
                   </table>
                 </div>
+                {/* Pagination */}
+                {totalPages > 1 && (
+                  <div className="px-6 py-4 border-t border-gray-200 flex items-center justify-between">
+                    <div className="text-sm text-gray-700">
+                      Showing {startIndex + 1} to {Math.min(endIndex, filteredResults.length)} of {filteredResults.length} results
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                        disabled={currentPage === 1}
+                        className="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        Previous
+                      </button>
+                      <span className="px-4 py-2 text-sm text-gray-700">
+                        Page {currentPage} of {totalPages}
+                      </span>
+                      <button
+                        onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                        disabled={currentPage === totalPages}
+                        className="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        Next
+                      </button>
+                    </div>
+                  </div>
+                )}
+                </>
               ) : (
                 <div className="py-12 text-center text-gray-600">
-                  Run optimization to see results.
+                  Click "Run Optimization" to calculate optimal inventory for all products.
                 </div>
               )}
             </div>
