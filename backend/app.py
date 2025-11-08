@@ -7,14 +7,17 @@ import numpy as np
 import os
 from datetime import datetime, timedelta
 import requests
+from sklearn.preprocessing import StandardScaler
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend requests
 
 # Configuration
 CSV_PATH = "datasets/Sales Order.csv"
+ANOMALY_CSV_PATH = "datasets/anomaly_data.csv"
 CONVEX_URL = os.getenv("CONVEX_URL", "http://localhost:3000")  # Update with your Convex URL
 MODEL_PATH = "models/supply_chain_model.pkl"
+ANOMALY_MODEL_PATH = "models/isolation_forest.pkl"
 
 # Load CSV data
 sales_data = None
@@ -25,9 +28,17 @@ def load_sales_data():
     global sales_data, product_columns
     if os.path.exists(CSV_PATH):
         sales_data = pd.read_csv(CSV_PATH)
-        # Parse date column
-        sales_data['Date'] = pd.to_datetime(sales_data['Date'])
-        # Get product columns (all columns except Date)
+
+        # ✅ FIXED DATE PARSING (accepts "13-02-2025", "13-02-2025 00:00", mixed)
+        sales_data['Date'] = pd.to_datetime(
+            sales_data['Date'],
+            format='mixed',
+            dayfirst=True,
+            errors='coerce'
+        )
+        sales_data = sales_data.dropna(subset=['Date'])
+        sales_data = sales_data.sort_values('Date')
+
         product_columns = [col for col in sales_data.columns if col != 'Date']
         return True
     return False
@@ -60,31 +71,27 @@ def load_data_to_convex():
         products = []
         demand_data = []
         
-        # Prepare products
         for col in product_columns:
             products.append({
                 "product_id": col,
                 "name": col
             })
         
-        # Prepare demand history
         for _, row in sales_data.iterrows():
             date_str = row['Date'].strftime('%Y-%m-%d')
             for col in product_columns:
                 demand_value = float(row[col]) if pd.notna(row[col]) else 0.0
-                if demand_value > 0:  # Only include non-zero demands
+                if demand_value > 0:
                     demand_data.append({
                         "date": date_str,
                         "product_id": col,
                         "demand": demand_value
                     })
         
-        # Send to Convex (you'll need to implement the HTTP action in Convex)
-        # For now, return the data structure
         return jsonify({
             "success": True,
             "products": products,
-            "demand_data": demand_data[:1000],  # Limit for testing
+            "demand_data": demand_data[:1000],
             "total_demand_records": len(demand_data)
         })
     except Exception as e:
@@ -92,7 +99,6 @@ def load_data_to_convex():
 
 @app.route("/api/history", methods=["GET"])
 def get_history():
-    """Get historical demand data for a product"""
     product_id = request.args.get("product_id")
     
     if not product_id:
@@ -105,9 +111,8 @@ def get_history():
         return jsonify({"error": f"Product {product_id} not found"}), 400
     
     try:
-        # Get historical data for the product
         product_data = sales_data[['Date', product_id]].copy()
-        product_data = product_data[product_data[product_id] > 0]  # Remove zeros
+        product_data = product_data[product_data[product_id] > 0]
         product_data = product_data.sort_values('Date')
         
         history = []
@@ -126,7 +131,6 @@ def get_history():
 
 @app.route("/api/predict", methods=["POST"])
 def predict():
-    """Generate 30-day forecast for a product using ML model or statistical method"""
     data = request.json
     product_id = data.get("product_id")
     
@@ -140,36 +144,24 @@ def predict():
         return jsonify({"error": f"Product {product_id} not found in CSV"}), 400
     
     try:
-        # Get historical data for the product
         product_data = sales_data[['Date', product_id]].copy()
-        product_data = product_data[product_data[product_id] > 0]  # Remove zeros
+        product_data = product_data[product_data[product_id] > 0]
         product_data = product_data.sort_values('Date')
         
         if len(product_data) < 7:
-            return jsonify({"error": "Insufficient historical data (minimum 7 days required)"}), 400
+            return jsonify({"error": "Insufficient historical data"}), 400
         
-        # Try to use ML model if available, otherwise use statistical forecasting
-        predictions = None
         try:
-            # Attempt to load and use ML model
             predictions = predict_with_ml_model(product_id, product_data)
-        except Exception as ml_error:
-            print(f"ML model prediction failed: {ml_error}, using statistical method")
-            # Fallback to statistical forecasting
+        except:
             predictions = generate_forecast(product_data[product_id].values, 30)
         
-        # Generate forecast dates
         last_date = product_data['Date'].iloc[-1]
-        forecast_dates = []
-        for i in range(1, 31):
-            forecast_date = last_date + timedelta(days=i)
-            forecast_dates.append(forecast_date.strftime('%Y-%m-%d'))
+        forecast_dates = [(last_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(1, 31)]
         
-        # Create forecast results with confidence intervals
         forecast_results = []
         for i, (date, pred) in enumerate(zip(forecast_dates, predictions)):
-            # Calculate confidence intervals (increasing uncertainty over time)
-            uncertainty = max(0.1, 0.05 + (i * 0.01))  # 5-35% uncertainty
+            uncertainty = max(0.1, 0.05 + (i * 0.01))
             confidence_lower = max(0, pred * (1 - uncertainty))
             confidence_upper = pred * (1 + uncertainty)
             
@@ -188,69 +180,42 @@ def predict():
         return jsonify({"error": str(e)}), 500
 
 def predict_with_ml_model(product_id, product_data):
-    """Attempt to predict using the ML model"""
-    try:
-        # Check if model file exists
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError("Model file not found")
-        
-        # Load model (simplified - you may need to adjust based on your model structure)
-        # For now, fall back to statistical method
-        # TODO: Integrate with actual model loading when model structure is known
-        raise NotImplementedError("ML model integration pending")
-        
-    except Exception as e:
-        raise e
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError("Model file not found")
+    raise NotImplementedError("ML model integration pending")
 
 def generate_forecast(historical_data, days=30):
-    """Generate forecast using moving average and trend analysis"""
-    # Use last 30 days for moving average
     window = min(30, len(historical_data))
     recent_data = historical_data[-window:]
-    
-    # Calculate moving average
     ma = np.mean(recent_data)
     
-    # Calculate trend (linear regression on recent data)
     if len(recent_data) > 7:
         x = np.arange(len(recent_data))
         trend = np.polyfit(x, recent_data, 1)[0]
     else:
         trend = 0
     
-    # Generate predictions
     predictions = []
     for i in range(1, days + 1):
-        # Base prediction with trend
         pred = ma + (trend * i)
-        
-        # Add some seasonality (weekly pattern)
         day_of_week = (i - 1) % 7
-        if day_of_week < 5:  # Weekday
+        if day_of_week < 5:
             pred *= 1.05
-        else:  # Weekend
+        else:
             pred *= 0.95
-        
-        # Ensure non-negative
-        pred = max(0, pred)
-        predictions.append(pred)
+        predictions.append(max(0, pred))
     
     return predictions
 
 @app.route("/api/dashboard/summary", methods=["GET"])
 def get_dashboard_summary():
-    """Get dashboard summary statistics from CSV data"""
     if sales_data is None:
         return jsonify({"error": "Sales data not loaded"}), 500
     
     try:
-        # Calculate summary statistics
         total_products = len(product_columns)
-        
-        # Get recent demand (last 30 days) for all products
         recent_data = sales_data.tail(30)
         
-        # Calculate average daily demand per product
         product_stats = []
         for col in product_columns:
             product_demand = recent_data[col].fillna(0)
@@ -258,38 +223,18 @@ def get_dashboard_summary():
             max_daily_demand = product_demand.max()
             std_daily_demand = product_demand.std() if len(product_demand) > 1 else 0
             
-            # Estimate current stock based on demand patterns
-            # Simulate inventory: start with buffer, consume over time, restock periodically
-            # More realistic: vary stock levels based on demand volatility
-            
-            # Calculate demand variability
-            cv = (std_daily_demand / avg_daily_demand) if avg_daily_demand > 0 else 0  # Coefficient of variation
-            
-            # Estimate current stock level (simulate inventory management)
-            # Products with higher variability need more safety stock
-            safety_stock_multiplier = 1.5 + (cv * 0.5)  # 1.5 to 2.0x based on variability
-            base_stock_days = 30  # Base target: 30 days of stock
+            cv = (std_daily_demand / avg_daily_demand) if avg_daily_demand > 0 else 0
+            safety_stock_multiplier = 1.5 + (cv * 0.5)
+            base_stock_days = 30
             target_stock = avg_daily_demand * base_stock_days * safety_stock_multiplier
             
-            # Simulate inventory depletion and replenishment
-            # Assume stock depletes based on recent trend
             last_14_days = sales_data.tail(14)[col].fillna(0)
-            recent_trend = last_14_days.iloc[-7:].mean() - last_14_days.iloc[:7].mean()
-            
-            # Estimate current stock (starts at target, depletes with demand)
-            # Simple model: stock = target - (recent_consumption - recent_replenishment)
-            days_since_last_restock = 15  # Assume restocking every ~15 days
+            days_since_last_restock = 15
             recent_consumption = avg_daily_demand * days_since_last_restock
             estimated_stock = max(0, target_stock - recent_consumption + (avg_daily_demand * 30))
-            
-            # Ensure stock doesn't go negative and has some minimum
-            estimated_stock = max(estimated_stock, avg_daily_demand * 5)  # Minimum 5 days stock
-            
-            # Calculate days of stock remaining
+            estimated_stock = max(estimated_stock, avg_daily_demand * 5)
             days_of_stock = (estimated_stock / avg_daily_demand) if avg_daily_demand > 0 else 0
             
-            # Calculate utilization (based on recent demand vs capacity estimate)
-            # Capacity estimate based on max demand with buffer
             capacity_estimate = max_daily_demand * 1.5 if max_daily_demand > 0 else avg_daily_demand * 2
             utilization_rate = min(100, (avg_daily_demand / capacity_estimate * 100)) if capacity_estimate > 0 else 0
             
@@ -303,13 +248,8 @@ def get_dashboard_summary():
                 "avg_daily_demand": round(avg_daily_demand, 2)
             })
         
-        # Count low stock items (less than 7 days)
         low_stock_items = len([p for p in product_stats if p["days_of_stock"] < 7])
-        
-        # Calculate average utilization
         avg_utilization = sum(p["utilization_rate"] for p in product_stats) / len(product_stats) if product_stats else 0
-        
-        # Estimate urgent procurement (items with very low stock or high demand)
         urgent_procurement = len([p for p in product_stats if p["days_of_stock"] < 7 or p["utilization_rate"] > 80])
         
         return jsonify({
@@ -324,7 +264,6 @@ def get_dashboard_summary():
 
 @app.route("/api/dashboard/products", methods=["GET"])
 def get_dashboard_products():
-    """Get list of products for dashboard"""
     if sales_data is None:
         return jsonify({"error": "Sales data not loaded"}), 500
     
@@ -342,16 +281,13 @@ def get_dashboard_products():
 
 @app.route("/api/procurement/suggestions", methods=["GET"])
 def get_procurement_suggestions():
-    """Get procurement suggestions based on CSV data with dummy supplier data"""
     if sales_data is None:
         return jsonify({"error": "Sales data not loaded"}), 500
     
     try:
-        # Get inventory status first (reuse dashboard logic)
         recent_data = sales_data.tail(30)
         suggestions = []
         
-        # Dummy suppliers (generic suppliers for all products)
         dummy_suppliers = [
             {"supplier_id": "SUP001", "name": "Premium Supplier Co.", "base_price": 100, "lead_time": 7, "reliability": 0.95},
             {"supplier_id": "SUP002", "name": "Fast Delivery Inc.", "base_price": 120, "lead_time": 3, "reliability": 0.88},
@@ -364,7 +300,6 @@ def get_procurement_suggestions():
             max_daily_demand = product_demand.max()
             std_daily_demand = product_demand.std() if len(product_demand) > 1 else 0
             
-            # Calculate inventory metrics (same as dashboard)
             cv = (std_daily_demand / avg_daily_demand) if avg_daily_demand > 0 else 0
             safety_stock_multiplier = 1.5 + (cv * 0.5)
             base_stock_days = 30
@@ -377,18 +312,14 @@ def get_procurement_suggestions():
             estimated_stock = max(estimated_stock, avg_daily_demand * 5)
             days_of_stock = (estimated_stock / avg_daily_demand) if avg_daily_demand > 0 else 0
             
-            # Determine if procurement is needed (only suggest for products with low stock)
-            reorder_point = 21  # Reorder when less than 21 days of stock
+            reorder_point = 21
             needs_procurement = days_of_stock < reorder_point and avg_daily_demand > 0
             
             if needs_procurement:
-                # Calculate recommended quantity (enough for 45-60 days based on demand)
                 recommended_quantity = avg_daily_demand * 45
-                # Add safety buffer for high variability products
-                if cv > 0.5:  # High variability
+                if cv > 0.5:
                     recommended_quantity = avg_daily_demand * 60
                 
-                # Determine priority based on stock level
                 if days_of_stock < 7:
                     priority = "High"
                 elif days_of_stock < 14:
@@ -396,11 +327,8 @@ def get_procurement_suggestions():
                 else:
                     priority = "Low"
                 
-                # Generate suggestions for each supplier (show all options)
                 for supplier in dummy_suppliers:
-                    # Vary price based on product (simulate different product costs)
-                    # Use product hash to create consistent pricing per product
-                    price_variation = (hash(col) % 50) / 100 + 0.75  # 0.75 to 1.25 multiplier
+                    price_variation = (hash(col) % 50) / 100 + 0.75
                     price_per_unit = supplier["base_price"] * price_variation
                     estimated_cost = recommended_quantity * price_per_unit
                     
@@ -417,28 +345,217 @@ def get_procurement_suggestions():
                         "price_per_unit": round(price_per_unit, 2)
                     })
         
-        # Sort by priority (High first)
         priority_order = {"High": 3, "Medium": 2, "Low": 1}
-        suggestions.sort(key=lambda x: (
-            -priority_order.get(x["priority"], 0),
-            x["estimated_cost"]  # Secondary sort by cost
-        ))
+        suggestions.sort(key=lambda x: (-priority_order.get(x["priority"], 0), x["estimated_cost"]))
         
-        return jsonify({
-            "suggestions": suggestions,
-            "total_count": len(suggestions)
-        })
+        return jsonify({"suggestions": suggestions, "total_count": len(suggestions)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/anomalies/detect", methods=["POST"])
+def detect_anomalies():
+    try:
+        if not os.path.exists(ANOMALY_CSV_PATH):
+            return jsonify({"error": f"Anomaly data CSV not found at {ANOMALY_CSV_PATH}"}), 404
+        
+        anomaly_data = pd.read_csv(ANOMALY_CSV_PATH)
+        
+        if len(anomaly_data) == 0:
+            return jsonify({"error": "Anomaly data CSV is empty"}), 400
+        
+        if not os.path.exists(ANOMALY_MODEL_PATH):
+            return jsonify({"error": f"Anomaly model not found at {ANOMALY_MODEL_PATH}"}), 404
+        
+        try:
+            with open(ANOMALY_MODEL_PATH, 'rb') as f:
+                model_data = pickle.load(f)
+        except Exception as e:
+            return jsonify({"error": f"Failed to load model: {str(e)}"}), 500
+        
+        if isinstance(model_data, dict):
+            model = model_data.get('model')
+            scaler = model_data.get('scaler')
+        else:
+            model = model_data
+            scaler = None
+        
+        if model is None:
+            return jsonify({"error": "Invalid model format: model is None"}), 500
+        
+        if not hasattr(model, 'predict'):
+            return jsonify({"error": "Model does not have predict method"}), 500
+        
+        feature_columns = ['current_demand', 'current_stock', 'warehouse_capacity', 'lead_time_days', 'price_per_unit']
+        
+        missing_cols = [col for col in feature_columns if col not in anomaly_data.columns]
+        if missing_cols:
+            return jsonify({"error": f"Missing columns in CSV: {missing_cols}"}), 400
+        
+        for col in feature_columns:
+            if anomaly_data[col].isna().any():
+                anomaly_data[col] = anomaly_data[col].fillna(anomaly_data[col].median() if anomaly_data[col].median() > 0 else 0)
+        
+        features = anomaly_data[feature_columns].values.astype(np.float64)
+        
+        if scaler is not None:
+            try:
+                features = scaler.transform(features)
+            except Exception as e:
+                return jsonify({"error": f"Failed to scale features: {str(e)}"}), 500
+        
+        try:
+            predictions = model.predict(features)
+        except Exception as e:
+            return jsonify({"error": f"Model prediction failed: {str(e)}"}), 500
+        
+        try:
+            if hasattr(model, 'decision_function'):
+                anomaly_scores = -model.decision_function(features)
+            elif hasattr(model, 'score_samples'):
+                anomaly_scores = -model.score_samples(features)
+            else:
+                anomaly_scores = np.where(predictions == -1, 1.0, 0.0)
+        except Exception as e:
+            return jsonify({"error": f"Failed to get anomaly scores: {str(e)}"}), 500
+        
+        if np.any(predictions == -1):
+            threshold = None
+        else:
+            threshold = float(np.percentile(anomaly_scores, 90))
+        
+        anomalies = []
+        products_dict = {}
+        
+        try:
+            products_df = pd.read_csv(ANOMALY_CSV_PATH)
+            product_details = {}
+            for _, row in products_df.iterrows():
+                product_id = str(row['product_id'])
+                product_details[product_id] = {
+                    "current_demand": float(row.get('current_demand', 0)),
+                    "current_stock": float(row.get('current_stock', 0)),
+                    "warehouse_capacity": float(row.get('warehouse_capacity', 0)),
+                    "lead_time_days": int(row.get('lead_time_days', 0)),
+                    "price_per_unit": float(row.get('price_per_unit', 0))
+                }
+        except Exception:
+            product_details = {}
+        
+        for idx, row in anomaly_data.iterrows():
+            product_id = str(row['product_id'])
+            product_name = product_id
+            
+            products_dict[product_id] = {
+                "product_id": product_id,
+                "name": product_name,
+                **(product_details.get(product_id) or {})
+            }
+            
+            is_anomaly = predictions[idx] == -1
+            
+            if is_anomaly:
+                score = float(anomaly_scores[idx])
+                
+                anomaly_indices = np.where(predictions == -1)[0]
+                if len(anomaly_indices) > 0:
+                    anomaly_only_scores = anomaly_scores[anomaly_indices]
+                    score_percentile_5 = np.percentile(anomaly_only_scores, 5)
+                    score_percentile_10 = np.percentile(anomaly_only_scores, 10)
+                    
+                    if score < score_percentile_5:
+                        severity = "critical"
+                    elif score < score_percentile_10:
+                        severity = "warning"
+                    else:
+                        severity = "normal"
+                else:
+                    severity = "warning"
+                
+                demand = float(row['current_demand'])
+                stock = float(row['current_stock'])
+                capacity = float(row['warehouse_capacity'])
+                stock_ratio = stock / capacity if capacity > 0 else 0
+                
+                if stock_ratio < 0.1:
+                    anomaly_type = "low_inventory"
+                    description = f"Very low inventory: {stock:.0f} units ({stock_ratio*100:.1f}% of capacity)"
+                elif stock_ratio > 0.9:
+                    anomaly_type = "high_inventory"
+                    description = f"High inventory: {stock:.0f} units ({stock_ratio*100:.1f}% of capacity)"
+                elif demand > capacity * 0.8:
+                    anomaly_type = "demand_spike"
+                    description = f"Unusual demand: {demand:.0f} units (exceeds 80% of capacity)"
+                else:
+                    anomaly_type = "supply_chain_anomaly"
+                    description = f"Supply chain anomaly detected (score: {score:.3f})"
+                
+                product_info = product_details.get(product_id, {})
+                actual_demand = product_info.get('current_demand', demand)
+                actual_stock = product_info.get('current_stock', stock)
+                actual_capacity = product_info.get('warehouse_capacity', capacity)
+                
+                anomalies.append({
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "type": anomaly_type,
+                    "severity": severity,
+                    "description": description,
+                    "detected_at": datetime.now().isoformat(),
+                    "value": score,
+                    "threshold": float(threshold) if threshold is not None else 0.0,
+                    "current_demand": actual_demand,
+                    "current_stock": actual_stock,
+                    "warehouse_capacity": actual_capacity,
+                    "lead_time_days": int(product_info.get('lead_time_days', row.get('lead_time_days', 0))),
+                    "price_per_unit": float(product_info.get('price_per_unit', row.get('price_per_unit', 0)))
+                })
+        
+        products = list(products_dict.values())
+        
+        return jsonify({
+            "success": True,
+            "anomalies": anomalies,
+            "products": products,
+            "total_detected": len(anomalies),
+            "total_checked": len(anomaly_data)
+        })
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"Error in detect_anomalies: {error_trace}")
+        return jsonify({"error": f"Anomaly detection failed: {str(e)}", "trace": error_trace}), 500
+
 @app.route("/api/health", methods=["GET"])
 def health():
-    """Health check endpoint"""
     return jsonify({
         "status": "healthy",
         "data_loaded": sales_data is not None,
         "products_count": len(product_columns) if product_columns else 0
     })
+
+@app.route("/api/anomalies/raw", methods=["GET"])
+def get_raw_anomaly_csv():
+    try:
+        if not os.path.exists(ANOMALY_CSV_PATH):
+            return jsonify({"error": f"Anomaly data CSV not found at {ANOMALY_CSV_PATH}"}), 404
+
+        df = pd.read_csv(ANOMALY_CSV_PATH)
+        rows = []
+        for _, r in df.iterrows():
+            rows.append({
+                "product_id": str(r.get('product_id')),
+                "current_demand": float(r.get('current_demand', 0) or 0),
+                "current_stock": float(r.get('current_stock', 0) or 0),
+                "warehouse_capacity": float(r.get('warehouse_capacity', 0) or 0),
+                "lead_time_days": int(r.get('lead_time_days', 0) or 0),
+                "price_per_unit": float(r.get('price_per_unit', 0) or 0),
+            })
+
+        return jsonify({"rows": rows, "total": len(rows)})
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

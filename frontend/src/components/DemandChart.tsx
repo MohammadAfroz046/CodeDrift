@@ -45,14 +45,39 @@ export default function DemandChart({ demandHistory, forecasts }: DemandChartPro
     return [...historicalData, ...forecastData];
   }, [demandHistory, forecasts]);
 
-  const maxValue = useMemo(() => {
-    const values = chartData.flatMap(d => [
-      d.actual || 0,
-      d.predicted || 0,
-      d.upper || 0
-    ]);
-    return Math.max(...values) * 1.1;
-  }, [chartData]);
+  const { minValue, maxValue } = useMemo(() => {
+    // Collect all values including confidence intervals
+    const allValues: number[] = [];
+    
+    // Add historical data
+    demandHistory.forEach(d => {
+      if (d.demand != null) allValues.push(d.demand);
+    });
+    
+    // Add forecast data including confidence intervals
+    forecasts.forEach(f => {
+      if (f.predicted_demand != null) allValues.push(f.predicted_demand);
+      if (f.confidence_lower != null) allValues.push(f.confidence_lower);
+      if (f.confidence_upper != null) allValues.push(f.confidence_upper);
+    });
+    
+    if (allValues.length === 0) {
+      return { minValue: 0, maxValue: 100 };
+    }
+    
+    const min = Math.min(...allValues);
+    const max = Math.max(...allValues);
+    
+    // Add padding: 10% above max, ensure min is at least 0
+    const range = max - min;
+    const paddedMin = Math.max(0, min - range * 0.1);
+    const paddedMax = max + range * 0.1;
+    
+    return {
+      minValue: paddedMin,
+      maxValue: paddedMax
+    };
+  }, [demandHistory, forecasts]);
 
   const chartWidth = Math.max(800, chartData.length * 10); // Dynamic width based on data
   const chartHeight = 400;
@@ -62,41 +87,44 @@ export default function DemandChart({ demandHistory, forecasts }: DemandChartPro
     <div className="w-full overflow-x-auto">
       <svg width={chartWidth} height={chartHeight} className="border rounded">
         {/* Grid lines */}
-        {[0, 0.25, 0.5, 0.75, 1].map(ratio => (
-          <g key={ratio}>
-            <line
-              x1={padding}
-              y1={padding + (chartHeight - 2 * padding) * ratio}
-              x2={chartWidth - padding}
-              y2={padding + (chartHeight - 2 * padding) * ratio}
-              stroke="#e5e7eb"
-              strokeWidth="1"
-            />
-            <text
-              x={padding - 10}
-              y={padding + (chartHeight - 2 * padding) * ratio + 5}
-              textAnchor="end"
-              fontSize="12"
-              fill="#6b7280"
-            >
-              {Math.round(maxValue * (1 - ratio))}
-            </text>
-          </g>
-        ))}
+        {[0, 0.25, 0.5, 0.75, 1].map(ratio => {
+          const value = maxValue - (maxValue - minValue) * ratio;
+          return (
+            <g key={ratio}>
+              <line
+                x1={padding}
+                y1={padding + (chartHeight - 2 * padding) * ratio}
+                x2={chartWidth - padding}
+                y2={padding + (chartHeight - 2 * padding) * ratio}
+                stroke="#e5e7eb"
+                strokeWidth="1"
+              />
+              <text
+                x={padding - 10}
+                y={padding + (chartHeight - 2 * padding) * ratio + 5}
+                textAnchor="end"
+                fontSize="12"
+                fill="#6b7280"
+              >
+                {Math.round(value)}
+              </text>
+            </g>
+          );
+        })}
 
         {/* Confidence interval area */}
         {forecasts.length > 0 && chartData.length > 0 && (
           <path
             d={`
-              M ${padding + (chartWidth - 2 * padding) * (demandHistory.length / Math.max(chartData.length, 1))} ${chartHeight - padding - (forecasts[0].confidence_lower / maxValue) * (chartHeight - 2 * padding)}
+              M ${padding + (chartWidth - 2 * padding) * (demandHistory.length / Math.max(chartData.length, 1))} ${chartHeight - padding - ((forecasts[0].confidence_lower - minValue) / (maxValue - minValue)) * (chartHeight - 2 * padding)}
               ${forecasts.map((f, i) => {
                 const x = padding + (chartWidth - 2 * padding) * ((demandHistory.length + i) / Math.max(chartData.length, 1));
-                const yUpper = chartHeight - padding - (f.confidence_upper / maxValue) * (chartHeight - 2 * padding);
+                const yUpper = chartHeight - padding - ((f.confidence_upper - minValue) / (maxValue - minValue)) * (chartHeight - 2 * padding);
                 return `L ${x} ${yUpper}`;
               }).join(' ')}
               ${forecasts.slice().reverse().map((f, i) => {
                 const x = padding + (chartWidth - 2 * padding) * ((demandHistory.length + forecasts.length - 1 - i) / Math.max(chartData.length, 1));
-                const yLower = chartHeight - padding - (f.confidence_lower / maxValue) * (chartHeight - 2 * padding);
+                const yLower = chartHeight - padding - ((f.confidence_lower - minValue) / (maxValue - minValue)) * (chartHeight - 2 * padding);
                 return `L ${x} ${yLower}`;
               }).join(' ')}
               Z
@@ -111,7 +139,7 @@ export default function DemandChart({ demandHistory, forecasts }: DemandChartPro
           <path
             d={demandHistory.map((d, i) => {
               const x = padding + (chartWidth - 2 * padding) * (i / Math.max(chartData.length, 1));
-              const y = chartHeight - padding - (d.demand / maxValue) * (chartHeight - 2 * padding);
+              const y = chartHeight - padding - ((d.demand - minValue) / (maxValue - minValue)) * (chartHeight - 2 * padding);
               return `${i === 0 ? 'M' : 'L'} ${x} ${y}`;
             }).join(' ')}
             stroke="#2563eb"
@@ -125,7 +153,7 @@ export default function DemandChart({ demandHistory, forecasts }: DemandChartPro
           <path
             d={forecasts.map((f, i) => {
               const x = padding + (chartWidth - 2 * padding) * ((demandHistory.length + i) / Math.max(chartData.length, 1));
-              const y = chartHeight - padding - (f.predicted_demand / maxValue) * (chartHeight - 2 * padding);
+              const y = chartHeight - padding - ((f.predicted_demand - minValue) / (maxValue - minValue)) * (chartHeight - 2 * padding);
               return `${i === 0 ? 'M' : 'L'} ${x} ${y}`;
             }).join(' ')}
             stroke="#dc2626"
@@ -138,7 +166,7 @@ export default function DemandChart({ demandHistory, forecasts }: DemandChartPro
         {/* Data points - Historical */}
         {demandHistory.map((d, i) => {
           const x = padding + (chartWidth - 2 * padding) * (i / Math.max(chartData.length, 1));
-          const y = chartHeight - padding - (d.demand / maxValue) * (chartHeight - 2 * padding);
+          const y = chartHeight - padding - ((d.demand - minValue) / (maxValue - minValue)) * (chartHeight - 2 * padding);
           return (
             <circle
               key={`hist-${i}`}
@@ -153,7 +181,7 @@ export default function DemandChart({ demandHistory, forecasts }: DemandChartPro
         {/* Data points - Forecasts */}
         {forecasts.map((f, i) => {
           const x = padding + (chartWidth - 2 * padding) * ((demandHistory.length + i) / Math.max(chartData.length, 1));
-          const y = chartHeight - padding - (f.predicted_demand / maxValue) * (chartHeight - 2 * padding);
+          const y = chartHeight - padding - ((f.predicted_demand - minValue) / (maxValue - minValue)) * (chartHeight - 2 * padding);
           return (
             <circle
               key={`forecast-${i}`}

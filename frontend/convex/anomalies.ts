@@ -40,127 +40,94 @@ export const list = query({
 export const detectAnomalies = mutation({
   args: {},
   handler: async (ctx) => {
-    // Clear existing anomalies
-    const existingAnomalies = await ctx.db.query("anomalies").collect();
-    for (const anomaly of existingAnomalies) {
-      await ctx.db.delete(anomaly._id);
-    }
-
-    const products = await ctx.db.query("products").collect();
+    const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5000";
     
-    for (const product of products) {
-      // Get demand history
-      const demandHistory = await ctx.db
-        .query("demand_history")
-        .withIndex("by_product_and_date", (q) => q.eq("product_id", product.product_id))
-        .collect();
-      
-      if (demandHistory.length < 14) continue; // Need at least 2 weeks of data
-      
-      // Sort by date
-      demandHistory.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-      
-      // Calculate statistics for anomaly detection
-      const demands = demandHistory.map(d => d.demand);
-      const mean = demands.reduce((sum, val) => sum + val, 0) / demands.length;
-      const variance = demands.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / demands.length;
-      const stdDev = Math.sqrt(variance);
-      
-      // Z-score based anomaly detection
-      const zThreshold = 2.5; // Values beyond 2.5 standard deviations
-      
-      for (let i = 0; i < demandHistory.length; i++) {
-        const demand = demandHistory[i];
-        const zScore = Math.abs((demand.demand - mean) / stdDev);
+    try {
+      // Call backend API to detect anomalies using Isolation Forest model
+      const response = await fetch(`${BACKEND_URL}/api/anomalies/detect`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        let errorMessage = "Failed to detect anomalies";
+        try {
+          const errorData = await response.json();
+          errorMessage = errorData.error || errorData.message || errorMessage;
+          if (errorData.trace) {
+            console.error("Backend error trace:", errorData.trace);
+          }
+        } catch (e) {
+          // If response is not JSON, get text
+          const text = await response.text().catch(() => "");
+          errorMessage = text || errorMessage;
+        }
+        throw new Error(errorMessage);
+      }
+
+      const data = await response.json();
+      const anomalies = data.anomalies || [];
+      const products = data.products || [];
+
+      // Create/update products from CSV data
+      for (const product of products) {
+        // Check if product already exists
+        const existingProduct = await ctx.db
+          .query("products")
+          .withIndex("by_product_id", (q) => q.eq("product_id", product.product_id))
+          .first();
         
-        if (zScore > zThreshold) {
-          const severity = zScore > 3.5 ? "critical" : zScore > 3 ? "warning" : "normal";
-          
-          await ctx.db.insert("anomalies", {
-            type: "demand_spike",
-            severity,
+        if (existingProduct) {
+          // Update product name if needed
+          if (existingProduct.name !== product.name) {
+            await ctx.db.patch(existingProduct._id, {
+              name: product.name,
+            });
+          }
+        } else {
+          // Create new product
+          await ctx.db.insert("products", {
             product_id: product.product_id,
-            description: `Unusual demand detected: ${demand.demand} units (${zScore.toFixed(2)} std devs from mean)`,
-            detected_at: new Date(demand.date).getTime(),
-            value: demand.demand,
-            threshold: mean + (zThreshold * stdDev),
+            name: product.name,
+            category: undefined,
           });
         }
       }
-      
-      // Check for recent trend anomalies (sudden changes in pattern)
-      const recentData = demandHistory.slice(-14); // Last 2 weeks
-      const olderData = demandHistory.slice(-28, -14); // Previous 2 weeks
-      
-      if (olderData.length >= 7 && recentData.length >= 7) {
-        const recentMean = recentData.reduce((sum, d) => sum + d.demand, 0) / recentData.length;
-        const olderMean = olderData.reduce((sum, d) => sum + d.demand, 0) / olderData.length;
-        
-        const percentChange = Math.abs((recentMean - olderMean) / olderMean) * 100;
-        
-        if (percentChange > 50) { // More than 50% change
-          const severity = percentChange > 100 ? "critical" : "warning";
-          
-          await ctx.db.insert("anomalies", {
-            type: "trend_change",
-            severity,
-            product_id: product.product_id,
-            description: `Significant trend change detected: ${percentChange.toFixed(1)}% change in demand pattern`,
-            detected_at: Date.now(),
-            value: recentMean,
-            threshold: olderMean,
-          });
-        }
-      }
-    }
-    
-    // Check supplier reliability anomalies
-    const suppliers = await ctx.db.query("suppliers").collect();
-    for (const supplier of suppliers) {
-      if (supplier.reliability < 0.8) {
-        const severity = supplier.reliability < 0.7 ? "critical" : "warning";
-        
-        await ctx.db.insert("anomalies", {
-          type: "supplier_reliability",
-          severity,
-          supplier_id: supplier.supplier_id,
-          description: `Low supplier reliability: ${(supplier.reliability * 100).toFixed(1)}%`,
-          detected_at: Date.now(),
-          value: supplier.reliability,
-          threshold: 0.8,
-        });
-      }
-    }
-    
-    // Check inventory level anomalies
-    const inventory = await ctx.db.query("inventory").collect();
-    for (const inv of inventory) {
-      const utilizationRate = inv.current_stock / inv.warehouse_capacity;
-      
-      if (utilizationRate > 0.9) {
-        await ctx.db.insert("anomalies", {
-          type: "high_inventory",
-          severity: "warning",
-          product_id: inv.product_id,
-          description: `High inventory utilization: ${(utilizationRate * 100).toFixed(1)}%`,
-          detected_at: Date.now(),
-          value: utilizationRate,
-          threshold: 0.9,
-        });
-      } else if (utilizationRate < 0.1) {
-        await ctx.db.insert("anomalies", {
-          type: "low_inventory",
-          severity: "warning",
-          product_id: inv.product_id,
-          description: `Very low inventory: ${(utilizationRate * 100).toFixed(1)}% capacity used`,
-          detected_at: Date.now(),
-          value: utilizationRate,
-          threshold: 0.1,
-        });
-      }
-    }
 
-    return { success: true, message: "Anomaly detection completed" };
+      // Clear existing anomalies
+      const existingAnomalies = await ctx.db.query("anomalies").collect();
+      for (const anomaly of existingAnomalies) {
+        await ctx.db.delete(anomaly._id);
+      }
+
+      // Insert new anomalies into database
+      for (const anomaly of anomalies) {
+        // Convert ISO string to timestamp
+        const detectedAt = new Date(anomaly.detected_at).getTime();
+        
+        await ctx.db.insert("anomalies", {
+          type: anomaly.type || "supply_chain_anomaly",
+          severity: anomaly.severity || "warning",
+          product_id: anomaly.product_id,
+          description: anomaly.description,
+          detected_at: detectedAt,
+          value: anomaly.value,
+          threshold: anomaly.threshold,
+        });
+      }
+
+      return { 
+        success: true, 
+        message: "Anomaly detection completed",
+        total_detected: anomalies.length,
+        total_checked: data.total_checked || 0
+      };
+    } catch (error) {
+      console.error("Anomaly detection error:", error);
+      throw new Error(`Failed to detect anomalies: ${error instanceof Error ? error.message : String(error)}`);
+    }
   },
 });
 

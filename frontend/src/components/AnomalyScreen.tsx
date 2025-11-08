@@ -1,3 +1,4 @@
+import { useState, useEffect } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import { toast } from "sonner";
@@ -11,14 +12,47 @@ interface AnomalyScreenProps {
 export default function AnomalyScreen({ onNavigate }: AnomalyScreenProps) {
   const anomalies = useQuery(api.anomalies.list) || [];
   const detectAnomalies = useMutation(api.anomalies.detectAnomalies);
+  const [loading, setLoading] = useState(false);
+  const [rawRows, setRawRows] = useState<Array<any>>([]);
+
+  useEffect(() => {
+    // Fetch raw anomaly CSV rows from backend so the UI can show CSV when no detected anomalies exist
+    const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string) || "http://localhost:5000";
+    const fetchRaw = async () => {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/anomalies/raw`);
+        if (res.ok) {
+          const data = await res.json();
+          setRawRows(data.rows || []);
+        } else {
+          // ignore silently - raw data is optional
+          setRawRows([]);
+        }
+      } catch (e) {
+        console.error("Failed to fetch raw anomaly CSV:", e);
+        setRawRows([]);
+      }
+    };
+
+    fetchRaw();
+  }, []);
 
   const handleDetectAnomalies = async () => {
+    setLoading(true);
     try {
-      await detectAnomalies();
-      toast.success("Anomaly detection completed!");
+      const result = await detectAnomalies();
+      const count = result?.total_detected || 0;
+      if (count > 0) {
+        toast.success(`Anomaly detection completed! Found ${count} anomalies.`);
+      } else {
+        toast.success("Anomaly detection completed! No anomalies found.");
+      }
     } catch (error) {
-      toast.error("Failed to detect anomalies");
-      console.error(error);
+      const errorMessage = error instanceof Error ? error.message : "Failed to detect anomalies";
+      toast.error(`Failed to detect anomalies: ${errorMessage}`);
+      console.error("Anomaly detection error:", error);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -35,9 +69,10 @@ export default function AnomalyScreen({ onNavigate }: AnomalyScreenProps) {
               <h1 className="text-3xl font-bold text-gray-900">Anomaly Detection</h1>
               <button
                 onClick={handleDetectAnomalies}
-                className="bg-purple-600 hover:bg-purple-700 text-white px-6 py-2 rounded-md font-medium transition-colors"
+                disabled={loading}
+                className="bg-purple-600 hover:bg-purple-700 disabled:bg-purple-400 disabled:cursor-not-allowed text-white px-6 py-2 rounded-md font-medium transition-colors"
               >
-                Run Detection
+                {loading ? "Detecting..." : "Run Detection"}
               </button>
             </div>
 
@@ -90,7 +125,9 @@ export default function AnomalyScreen({ onNavigate }: AnomalyScreenProps) {
               </div>
 
               <div className="overflow-x-auto">
-                <table className="min-w-full divide-y divide-gray-200">
+                {/* If convex anomalies exist, show them. Otherwise show raw CSV rows from backend. */}
+                {anomalies.length > 0 ? (
+                  <table className="min-w-full divide-y divide-gray-200">
                   <thead className="bg-gray-50">
                     <tr>
                       <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -117,10 +154,14 @@ export default function AnomalyScreen({ onNavigate }: AnomalyScreenProps) {
                           {anomaly.type === 'demand_spike' ? '📈 Demand Spike' :
                            anomaly.type === 'trend_change' ? '📊 Trend Change' :
                            anomaly.type === 'supplier_reliability' ? '🏭 Supplier Issue' :
+                           anomaly.type === 'low_inventory' ? '📉 Low Inventory' :
+                           anomaly.type === 'high_inventory' ? '📦 High Inventory' :
+                           anomaly.type === 'supply_chain_anomaly' ? '⚠️ Supply Chain Anomaly' :
                            '❓ Other'}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {anomaly.product_name || anomaly.supplier_name || 'N/A'}
+                          {/* Product IDs from anomaly_data.csv are the real product identifiers */}
+                          {anomaly.product_id || 'N/A'}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap">
                           <span className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${
@@ -141,10 +182,32 @@ export default function AnomalyScreen({ onNavigate }: AnomalyScreenProps) {
                     ))}
                   </tbody>
                 </table>
-                {anomalies.length === 0 && (
-                  <div className="py-12 text-center text-gray-600">
-                    No anomalies detected. Click "Run Detection" to check for new anomalies.
-                  </div>
+                ) : (
+                  // Show raw CSV rows when no detected anomalies exist
+                  <table className="min-w-full divide-y divide-gray-200">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Product ID</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Current Demand</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Current Stock</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Warehouse Capacity</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Lead Time (days)</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Price/unit</th>
+                      </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                      {rawRows.map((r) => (
+                        <tr key={r.product_id} className="hover:bg-gray-50">
+                          <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{r.product_id}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{r.current_demand}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{r.current_stock}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{r.warehouse_capacity}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{r.lead_time_days}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{r.price_per_unit}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 )}
               </div>
             </div>
