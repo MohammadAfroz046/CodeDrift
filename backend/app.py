@@ -9,15 +9,33 @@ from datetime import datetime, timedelta
 import requests
 from sklearn.preprocessing import StandardScaler
 
+# Gemini API
+try:
+    from google import genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    print("Warning: google-genai not installed. Gemini features will be disabled.")
+
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend requests
 
 # Configuration
 CSV_PATH = "datasets/Sales Order.csv"
 ANOMALY_CSV_PATH = "datasets/anomaly_data.csv"
+PROCUREMENT_CSV_PATH = "datasets/procurement_data.csv"
 CONVEX_URL = os.getenv("CONVEX_URL", "http://localhost:3000")  # Update with your Convex URL
 MODEL_PATH = "models/supply_chain_model.pkl"
 ANOMALY_MODEL_PATH = "models/isolation_forest.pkl"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyD5HySlKps-ELG3IKorxxgudJf1r3y2G9U")
+
+# Initialize Gemini client if available
+gemini_client = None
+if GEMINI_AVAILABLE and GEMINI_API_KEY:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"Warning: Failed to initialize Gemini client: {e}")
 
 # Load CSV data
 sales_data = None
@@ -180,9 +198,9 @@ def predict():
         return jsonify({"error": str(e)}), 500
 
 def predict_with_ml_model(product_id, product_data):
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError("Model file not found")
-    raise NotImplementedError("ML model integration pending")
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError("Model file not found")
+        raise NotImplementedError("ML model integration pending")
 
 def generate_forecast(historical_data, days=30):
     window = min(30, len(historical_data))
@@ -293,6 +311,8 @@ def get_procurement_suggestions():
             {"supplier_id": "SUP002", "name": "Fast Delivery Inc.", "base_price": 120, "lead_time": 3, "reliability": 0.88},
             {"supplier_id": "SUP003", "name": "Budget Suppliers Ltd.", "base_price": 80, "lead_time": 14, "reliability": 0.75},
         ]
+        # Lead time threshold (days). Do not propose suppliers whose lead time exceeds this value.
+        LEAD_TIME_THRESHOLD = 140
         
         for col in product_columns:
             product_demand = recent_data[col].fillna(0)
@@ -328,10 +348,14 @@ def get_procurement_suggestions():
                     priority = "Low"
                 
                 for supplier in dummy_suppliers:
+                    # Skip suppliers with unacceptable lead time
+                    if supplier.get("lead_time", 0) > LEAD_TIME_THRESHOLD:
+                        continue
+
                     price_variation = (hash(col) % 50) / 100 + 0.75
                     price_per_unit = supplier["base_price"] * price_variation
                     estimated_cost = recommended_quantity * price_per_unit
-                    
+
                     suggestions.append({
                         "product_id": col,
                         "product_name": col,
@@ -555,6 +579,216 @@ def get_raw_anomaly_csv():
     except Exception as e:
         import traceback
         print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/procurement/recommend", methods=["POST"])
+def recommend_supplier():
+    """Get AI-powered supplier recommendations for a product using Gemini"""
+    try:
+        data = request.json
+        product_id = data.get("product_id")
+        
+        if not product_id:
+            return jsonify({"error": "product_id is required"}), 400
+        
+        # Load procurement data
+        if not os.path.exists(PROCUREMENT_CSV_PATH):
+            return jsonify({"error": f"Procurement data CSV not found at {PROCUREMENT_CSV_PATH}"}), 404
+        
+        procurement_data = pd.read_csv(PROCUREMENT_CSV_PATH)
+        
+        # Filter suppliers for the product
+        product_suppliers = procurement_data[procurement_data['Product_Code'] == product_id].copy()
+        
+        if len(product_suppliers) == 0:
+            return jsonify({"error": f"No suppliers found for product {product_id}"}), 404
+        
+        # Define thresholds
+        RELIABILITY_THRESHOLD = 0.70  # 70%
+        LEAD_TIME_THRESHOLD = 140  # days - suppliers exceeding this will be excluded
+        TRANSPORTATION_COST_WEIGHT = 0.2
+        PRODUCT_COST_WEIGHT = 0.3
+        RELIABILITY_WEIGHT = 0.3
+        LEAD_TIME_WEIGHT = 0.2
+        
+        # Calculate scores for each supplier
+        suppliers = []
+        for _, row in product_suppliers.iterrows():
+            reliability = float(row['Reliability'])
+            lead_time = int(row['Lead_Time'])
+            transportation_cost = float(row['Transportation_Cost'])
+            supplier_price = float(row['Supplier_Price'])
+            total_cost = float(row['Total_Cost'])
+            supplier_id = str(row['Supplier_ID'])
+            product_name = str(row.get('Product_Name', product_id))
+            
+            # Check if supplier meets thresholds
+            meets_reliability = reliability >= RELIABILITY_THRESHOLD
+            meets_lead_time = lead_time <= LEAD_TIME_THRESHOLD
+            
+            # Exclude suppliers that exceed lead time threshold
+            if lead_time > LEAD_TIME_THRESHOLD:
+                continue  # Skip this supplier entirely
+            
+            # Only include suppliers that meet reliability threshold
+            if not meets_reliability:
+                continue  # Skip suppliers below reliability threshold
+            
+            # Normalize scores (0-1 scale, higher is better)
+            # For costs, lower is better, so invert
+            max_transport_cost = product_suppliers['Transportation_Cost'].max()
+            min_transport_cost = product_suppliers['Transportation_Cost'].min()
+            transport_score = 1 - ((transportation_cost - min_transport_cost) / (max_transport_cost - min_transport_cost + 1))
+            
+            max_product_cost = product_suppliers['Supplier_Price'].max()
+            min_product_cost = product_suppliers['Supplier_Price'].min()
+            product_cost_score = 1 - ((supplier_price - min_product_cost) / (max_product_cost - min_product_cost + 1))
+            
+            reliability_score = reliability  # Already 0-1
+            lead_time_score = 1 - (lead_time / LEAD_TIME_THRESHOLD) if lead_time <= LEAD_TIME_THRESHOLD else 0
+            
+            # Calculate weighted score
+            weighted_score = (
+                reliability_score * RELIABILITY_WEIGHT +
+                lead_time_score * LEAD_TIME_WEIGHT +
+                transport_score * TRANSPORTATION_COST_WEIGHT +
+                product_cost_score * PRODUCT_COST_WEIGHT
+            )
+            
+            # Add supplier to list (already filtered by thresholds)
+            suppliers.append({
+                    "supplier_id": supplier_id,
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "reliability": reliability,
+                    "lead_time": lead_time,
+                    "transportation_cost": transportation_cost,
+                    "supplier_price": supplier_price,
+                    "total_cost": total_cost,
+                    "min_order_quantity": int(row.get('Min_Order_Quantity', 0)),
+                    "delivery_days": int(row.get('Delivery_Days', lead_time)),
+                    "meets_reliability": meets_reliability,
+                    "meets_lead_time": meets_lead_time,
+                    "weighted_score": weighted_score,
+                    "reliability_score": reliability_score,
+                    "lead_time_score": lead_time_score,
+                    "transport_score": transport_score,
+                    "product_cost_score": product_cost_score
+                })
+        
+        if len(suppliers) == 0:
+            return jsonify({
+                "error": f"No suppliers meet the criteria for product {product_id}. Requirements: Reliability ≥ {RELIABILITY_THRESHOLD*100}%, Lead Time ≤ {LEAD_TIME_THRESHOLD} days"
+            }), 404
+        
+        # Sort by weighted score (best first)
+        suppliers.sort(key=lambda x: x['weighted_score'], reverse=True)
+        best_supplier = suppliers[0]
+        other_suppliers = suppliers[1:]
+        
+        # Generate AI explanations using Gemini
+        best_explanation = ""
+        other_explanations = {}
+        
+        if gemini_client:
+            try:
+                # Prepare data for Gemini
+                supplier_data_str = "\n".join([
+                    f"Supplier {s['supplier_id']}: Reliability={s['reliability']:.2%}, Lead_Time={s['lead_time']} days, "
+                    f"Transportation_Cost=${s['transportation_cost']:.2f}, Product_Price=${s['supplier_price']:.2f}, "
+                    f"Total_Cost=${s['total_cost']:.2f}, Score={s['weighted_score']:.3f}"
+                    for s in suppliers
+                ])
+                
+                # Generate explanation for best supplier
+                prompt_best = f"""You are a supply chain optimization expert. Analyze why this supplier is the best choice:
+
+Product: {product_id} ({best_supplier['product_name']})
+Selected Supplier: {best_supplier['supplier_id']}
+- Reliability: {best_supplier['reliability']:.2%}
+- Lead Time: {best_supplier['lead_time']} days
+- Transportation Cost: ${best_supplier['transportation_cost']:.2f}
+- Product Price: ${best_supplier['supplier_price']:.2f}
+- Total Cost: ${best_supplier['total_cost']:.2f}
+- Weighted Score: {best_supplier['weighted_score']:.3f}
+
+All Suppliers:
+{supplier_data_str}
+
+Thresholds: Reliability >= 70%, Lead Time <= 140 days
+
+Provide a concise 2-3 sentence explanation of why this supplier was selected, focusing on the balance between reliability, lead time, and cost."""
+                
+                chat = gemini_client.chats.create(model="gemini-1.5-flash")
+                response = chat.send_message(prompt_best)
+                best_explanation = response.text
+                
+                # Generate explanations for other suppliers
+                for supplier in other_suppliers:
+                    prompt_other = f"""You are a supply chain optimization expert. Explain why this supplier was NOT selected:
+
+Product: {product_id}
+Supplier: {supplier['supplier_id']}
+- Reliability: {supplier['reliability']:.2%}
+- Lead Time: {supplier['lead_time']} days
+- Transportation Cost: ${supplier['transportation_cost']:.2f}
+- Product Price: ${supplier['supplier_price']:.2f}
+- Total Cost: ${supplier['total_cost']:.2f}
+- Weighted Score: {supplier['weighted_score']:.3f}
+
+Best Supplier: {best_supplier['supplier_id']} (Score: {best_supplier['weighted_score']:.3f})
+
+Thresholds: Reliability >= 70%, Lead Time <= 140 days
+
+Provide a concise 1-2 sentence explanation of why this supplier was not selected, comparing it to the best option."""
+                    
+                    chat_other = gemini_client.chats.create(model="gemini-1.5-flash")
+                    response_other = chat_other.send_message(prompt_other)
+                    other_explanations[supplier['supplier_id']] = response_other.text
+                    
+            except Exception as e:
+                print(f"Gemini API error: {e}")
+                # Fallback to simple explanations
+                best_explanation = f"Selected based on optimal balance: {best_supplier['reliability']:.1%} reliability, {best_supplier['lead_time']} days lead time, and competitive total cost of ${best_supplier['total_cost']:.2f}."
+                for supplier in other_suppliers:
+                    other_explanations[supplier['supplier_id']] = f"Lower weighted score ({supplier['weighted_score']:.3f} vs {best_supplier['weighted_score']:.3f}) due to trade-offs in reliability, lead time, or cost."
+        else:
+            # Fallback explanations without Gemini
+            best_explanation = f"Selected based on optimal balance: {best_supplier['reliability']:.1%} reliability, {best_supplier['lead_time']} days lead time, and competitive total cost of ${best_supplier['total_cost']:.2f}."
+            for supplier in other_suppliers:
+                reasons = []
+                if supplier['reliability'] < best_supplier['reliability']:
+                    reasons.append(f"lower reliability ({supplier['reliability']:.1%} vs {best_supplier['reliability']:.1%})")
+                if supplier['lead_time'] > best_supplier['lead_time']:
+                    reasons.append(f"longer lead time ({supplier['lead_time']} vs {best_supplier['lead_time']} days)")
+                if supplier['total_cost'] > best_supplier['total_cost']:
+                    reasons.append(f"higher total cost (${supplier['total_cost']:.2f} vs ${best_supplier['total_cost']:.2f})")
+                other_explanations[supplier['supplier_id']] = f"Not selected due to: {', '.join(reasons) if reasons else 'lower overall score'}."
+        
+        return jsonify({
+            "success": True,
+            "product_id": product_id,
+            "product_name": best_supplier['product_name'],
+            "best_supplier": {
+                **best_supplier,
+                "explanation": best_explanation
+            },
+            "other_suppliers": [
+                {
+                    **supplier,
+                    "explanation": other_explanations.get(supplier['supplier_id'], "Not selected due to lower overall score.")
+                }
+                for supplier in other_suppliers
+            ],
+            "thresholds": {
+                "reliability_min": RELIABILITY_THRESHOLD,
+                "lead_time_max": LEAD_TIME_THRESHOLD
+            }
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
